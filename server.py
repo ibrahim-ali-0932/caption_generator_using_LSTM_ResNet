@@ -105,6 +105,7 @@ model.eval()
 
 # ----------------- CAPTION GENERATION -----------------
 def generate_caption(features: torch.Tensor, max_len=20):
+    """Greedy search caption generation"""
     input_word = torch.tensor([[word2idx["<start>"]]], dtype=torch.long).to(device)
     caption = []
 
@@ -125,6 +126,62 @@ def generate_caption(features: torch.Tensor, max_len=20):
         input_word = torch.tensor([[predicted_idx]], dtype=torch.long).to(device)
 
     return " ".join(caption)
+
+
+def generate_caption_beam_search(features: torch.Tensor, max_len=20, beam_width=3):
+    """Beam search caption generation"""
+    h0 = model.encoder(features).unsqueeze(0)
+    c0 = torch.zeros_like(h0)
+
+    # Each element: (score, word_indices, hidden_state, cell_state)
+    beams = [(0.0, [word2idx["<start>"]], h0, c0)]
+    complete_captions = []
+
+    for _ in range(max_len):
+        candidates = []
+
+        for score, word_indices, hidden, cell in beams:
+            if word_indices and idx2word.get(word_indices[-1]) == "<end>":
+                complete_captions.append((score, word_indices))
+                continue
+
+            last_word = torch.tensor([[word_indices[-1]]], dtype=torch.long).to(device)
+            x_embed = model.embedding(last_word)
+
+            _, (new_hidden, new_cell) = model.lstm(x_embed, (hidden, cell))
+            output = model.finallayer(new_hidden.squeeze(0))
+            log_probs = torch.nn.functional.log_softmax(output, dim=-1)
+
+            top_log_probs, top_indices = torch.topk(
+                log_probs[0], min(beam_width, log_probs.size(1))
+            )
+
+            for log_prob, idx in zip(top_log_probs, top_indices):
+                idx_item = idx.item()
+                new_score = score + log_prob.item()
+                new_word_indices = word_indices + [idx_item]
+                candidates.append((new_score, new_word_indices, new_hidden, new_cell))
+
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        beams = candidates[:beam_width]
+
+    complete_captions.extend((score, words) for score, words, _, _ in beams)
+    if complete_captions:
+        best_score, best_indices = max(complete_captions, key=lambda item: item[0])
+    else:
+        best_indices = []
+
+    caption_words = []
+    for idx in best_indices[1:]:
+        word = idx2word.get(idx, "<unk>")
+        if word == "<end>":
+            break
+        caption_words.append(word)
+
+    return " ".join(caption_words)
 
 
 def _normalize_tokens(text: str) -> list[str]:
@@ -180,6 +237,8 @@ async def predict_caption(
     file: UploadFile = File(...),
     reference: str | None = Form(default=None),
     references: str | None = Form(default=None),
+    search_method: str = Form(default="greedy"),
+    beam_width: int = Form(default=3),
 ):
     contents = await file.read()
     image = Image.open(io.BytesIO(contents)).convert("RGB")
@@ -187,8 +246,12 @@ async def predict_caption(
     # Extract feature vector
     features = extract_features(image)
 
-    # Generate caption
-    caption = generate_caption(features)
+    # Generate caption based on search method
+    search_key = search_method.lower().replace(" ", "")
+    if search_key in {"beam", "beamsearch", "beam_search"}:
+        caption = generate_caption_beam_search(features, beam_width=beam_width)
+    else:
+        caption = generate_caption(features)
 
     if not reference and not references:
         return {"caption": caption}
